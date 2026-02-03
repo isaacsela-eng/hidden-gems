@@ -1,169 +1,230 @@
-gpt v.2.1
-
 #!/usr/bin/env python3
-import sys, json, math, heapq, random
+import sys
+import json
+import math
 from collections import deque
 
-UNKNOWN_CELL = 0
-WALL_CELL = 1
-FLOOR_CELL = 2
+sys.stdout.flush()
 
-DIRECTION_OFFSETS = {
-    "N": (0, -1),
-    "S": (0, 1),
-    "W": (-1, 0),
-    "E": (1, 0),
-}
-
-def manhattan_distance(from_position, to_position):
-    return abs(from_position[0] - to_position[0]) + abs(from_position[1] - to_position[1])
-
-class CaveExplorationBot:
-    def __init__(self):
-        self.known_map = {}
-        self.recent_positions = deque(maxlen=20)
-
-    def remember_world(self, game_state):
-        bot_position = tuple(game_state["bot"])
-
-        for wall_x, wall_y in game_state.get("wall", []):
-            self.known_map[(wall_x, wall_y)] = WALL_CELL
-
-        for floor_x, floor_y in game_state.get("floor", []):
-            self.known_map.setdefault((floor_x, floor_y), FLOOR_CELL)
-
-        self.known_map[bot_position] = FLOOR_CELL
-        self.recent_positions.append(bot_position)
-
-        return bot_position
-
-    def get_walkable_positions_around(self, position):
-        for move_x, move_y in DIRECTION_OFFSETS.values():
-            next_position = (position[0] + move_x, position[1] + move_y)
-            if self.known_map.get(next_position, UNKNOWN_CELL) != WALL_CELL:
-                yield next_position
-
-    def find_path_using_a_star(self, start_position, target_position):
-        if start_position == target_position:
+class CaveBot:
+    def __init__(self, config):
+        self.width = config.get("width", 19)
+        self.height = config.get("height", 19)
+        self.vis_radius = config.get("vis_radius", 5)
+        self.max_ticks = config.get("max_ticks", 1200)
+        
+        # Map memory: 0 = unknown, 1 = floor, -1 = wall
+        self.map = [[0 for _ in range(self.height)] for _ in range(self.width)]
+        
+        # Track visited cells for exploration
+        self.visit_count = [[0 for _ in range(self.height)] for _ in range(self.width)]
+        
+        # Current position (will be updated each tick)
+        self.x = None
+        self.y = None
+        
+        # Current target we're pathfinding to
+        self.current_target = None
+        self.current_path = []
+        
+        # Directions: N, S, E, W
+        self.directions = {
+            "N": (0, -1),
+            "S": (0, 1),
+            "E": (1, 0),
+            "W": (-1, 0)
+        }
+        
+        self.tick = 0
+        
+    def update_map(self, bot_pos, walls, floors):
+        """Update internal map with visible cells"""
+        self.x, self.y = bot_pos
+        
+        # Mark current position as floor (we're standing here)
+        self.map[self.x][self.y] = 1
+        
+        # Mark visible walls
+        for wx, wy in walls:
+            self.map[wx][wy] = -1
+            
+        # Mark visible floors
+        for fx, fy in floors:
+            self.map[fx][fy] = 1
+            
+        # Increment visit count for current position
+        self.visit_count[self.x][self.y] += 1
+    
+    def get_neighbors(self, x, y):
+        """Get valid neighboring cells (not walls, within bounds)"""
+        neighbors = []
+        for direction, (dx, dy) in self.directions.items():
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height:
+                if self.map[nx][ny] != -1:  # Not a wall
+                    neighbors.append((nx, ny, direction))
+        return neighbors
+    
+    def bfs_path(self, target):
+        """Find shortest path to target using BFS"""
+        if (self.x, self.y) == target:
             return []
-
-        priority_queue = [(0, start_position)]
-        previous_position = {start_position: None}
-        travel_cost = {start_position: 0}
-
-        while priority_queue:
-            _, current_position = heapq.heappop(priority_queue)
-
-            if current_position == target_position:
-                break
-
-            for neighbor_position in self.get_walkable_positions_around(current_position):
-                new_cost = travel_cost[current_position] + 1
-
-                if neighbor_position not in travel_cost or new_cost < travel_cost[neighbor_position]:
-                    travel_cost[neighbor_position] = new_cost
-                    estimated_total_cost = new_cost + manhattan_distance(neighbor_position, target_position)
-                    heapq.heappush(priority_queue, (estimated_total_cost, neighbor_position))
-                    previous_position[neighbor_position] = current_position
-
-        if target_position not in previous_position:
-            return None
-
-        path = []
-        current_position = target_position
-        while current_position != start_position:
-            path.append(current_position)
-            current_position = previous_position[current_position]
-        path.reverse()
-
-        return path
-
-    def find_positions_next_to_unknown_area(self):
-        frontier_positions = []
-
-        for (x, y), cell_type in self.known_map.items():
-            if cell_type == FLOOR_CELL:
-                for move_x, move_y in DIRECTION_OFFSETS.values():
-                    if self.known_map.get((x + move_x, y + move_y), UNKNOWN_CELL) == UNKNOWN_CELL:
-                        frontier_positions.append((x, y))
-                        break
-
-        return frontier_positions
-
-    def gaussian_gem_signal(self, position, visible_gems, sigma=3.0):
-        signal_strength = 0.0
-
-        for gem in visible_gems:
-            gem_x, gem_y = gem["position"]
-            distance = manhattan_distance(position, (gem_x, gem_y))
-            signal_strength += math.exp(-(distance ** 2) / (2 * sigma ** 2))
-
-        return signal_strength
-
-    def choose_random_known_floor(self, current_position):
-        possible_positions = [
-            pos for pos, cell_type in self.known_map.items()
-            if cell_type == FLOOR_CELL and pos not in self.recent_positions
-        ]
-        return random.choice(possible_positions) if possible_positions else current_position
-
-    def choose_target_position(self, bot_position, visible_gems):
+            
+        queue = deque([(self.x, self.y, [])])
+        visited = {(self.x, self.y)}
+        
+        while queue:
+            cx, cy, path = queue.popleft()
+            
+            for nx, ny, direction in self.get_neighbors(cx, cy):
+                if (nx, ny) in visited:
+                    continue
+                    
+                new_path = path + [direction]
+                
+                if (nx, ny) == target:
+                    return new_path
+                    
+                visited.add((nx, ny))
+                queue.append((nx, ny, new_path))
+        
+        return None  # No path found
+    
+    def find_nearest_unexplored(self):
+        """Find nearest unexplored or rarely visited cell using BFS"""
+        queue = deque([(self.x, self.y)])
+        visited = {(self.x, self.y)}
+        
+        # Priority: completely unknown (0) > rarely visited floor (1)
+        candidates = []
+        
+        while queue:
+            cx, cy = queue.popleft()
+            
+            # Check if this is a good exploration target
+            if self.map[cx][cy] == 0:  # Unknown
+                return (cx, cy)
+            elif self.map[cx][cy] == 1 and self.visit_count[cx][cy] < 2:
+                candidates.append((cx, cy, self.visit_count[cx][cy]))
+            
+            for nx, ny, _ in self.get_neighbors(cx, cy):
+                if (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+        
+        # Return least visited floor if no unknown cells reachable
+        if candidates:
+            candidates.sort(key=lambda x: x[2])  # Sort by visit count
+            return (candidates[0][0], candidates[0][1])
+        
+        return None
+    
+    def score_gem(self, gem):
+        """Score a gem based on distance and TTL (Gaussian-inspired weighting)"""
+        gx, gy = gem["position"]
+        ttl = gem["ttl"]
+        
+        # Manhattan distance
+        dist = abs(gx - self.x) + abs(gy - self.y)
+        
+        # Score: higher is better
+        # Exponential decay based on distance (Gaussian-like)
+        # Plus urgency factor from TTL
+        distance_score = math.exp(-dist / self.vis_radius)  # 1.0 when close, decays when far
+        urgency_score = ttl / 300  # Normalize TTL (assuming max 300)
+        
+        return distance_score * 0.6 + urgency_score * 0.4
+    
+    def choose_direction(self, visible_gems):
+        """Main decision logic"""
+        # Phase 1: If we can see gems, prioritize the best one
         if visible_gems:
-            best_gem = max(visible_gems, key=lambda gem: gem["ttl"])
-            return tuple(best_gem["position"])
+            # Score and sort gems
+            scored_gems = [(gem, self.score_gem(gem)) for gem in visible_gems]
+            scored_gems.sort(key=lambda x: x[1], reverse=True)
+            
+            best_gem = scored_gems[0][0]
+            target_pos = tuple(best_gem["position"])
+            
+            # If we're already targeting this gem, continue
+            if self.current_target == target_pos and self.current_path:
+                return self.current_path.pop(0)
+            
+            # Calculate new path to gem
+            path = self.bfs_path(target_pos)
+            if path:
+                self.current_target = target_pos
+                self.current_path = path[1:] if len(path) > 1 else []
+                return path[0]
+        
+        # Phase 2: Exploration - find nearest unexplored/underexplored cell
+        if not self.current_path or self.tick % 10 == 0:  # Re-evaluate periodically
+            explore_target = self.find_nearest_unexplored()
+            if explore_target:
+                path = self.bfs_path(explore_target)
+                if path:
+                    self.current_target = explore_target
+                    self.current_path = path[1:] if len(path) > 1 else []
+                    return path[0]
+        
+        # Phase 3: If we have a cached path, follow it
+        if self.current_path:
+            return self.current_path.pop(0)
+        
+        # Phase 4: Desperate - move to least visited neighbor
+        best_dir = None
+        best_score = float('inf')
+        
+        for direction, (dx, dy) in self.directions.items():
+            nx, ny = self.x + dx, self.y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height:
+                if self.map[nx][ny] != -1:  # Not a wall
+                    score = self.visit_count[nx][ny]
+                    if score < best_score:
+                        best_score = score
+                        best_dir = direction
+        
+        return best_dir if best_dir else "N"  # Default to North if stuck
+    
+    def tick_update(self, data):
+        """Process one tick of game data"""
+        self.tick = data.get("tick", 0)
+        bot_pos = data.get("bot", [0, 0])
+        walls = data.get("wall", [])
+        floors = data.get("floor", [])
+        visible_gems = data.get("visible_gems", [])
+        
+        # Update our map knowledge
+        self.update_map(bot_pos, walls, floors)
+        
+        # Decide and return direction
+        return self.choose_direction(visible_gems)
 
-        frontier_positions = self.find_positions_next_to_unknown_area()
-        if frontier_positions:
-            return min(frontier_positions, key=lambda pos: manhattan_distance(bot_position, pos))
 
-        return self.choose_random_known_floor(bot_position)
-
-    def decide_direction(self, bot_position, target_position, visible_gems):
-        path_to_target = self.find_path_using_a_star(bot_position, target_position)
-
-        if path_to_target:
-            next_position = path_to_target[0]
-        else:
-            best_direction = None
-            strongest_signal = -1e9
-
-            for direction_name, (move_x, move_y) in DIRECTION_OFFSETS.items():
-                candidate_position = (bot_position[0] + move_x, bot_position[1] + move_y)
-
-                if self.known_map.get(candidate_position, UNKNOWN_CELL) != WALL_CELL:
-                    signal = self.gaussian_gem_signal(candidate_position, visible_gems)
-
-                    if signal > strongest_signal:
-                        strongest_signal = signal
-                        best_direction = direction_name
-
-            return best_direction or "N"
-
-        move_x = next_position[0] - bot_position[0]
-        move_y = next_position[1] - bot_position[1]
-
-        for direction_name, (dx, dy) in DIRECTION_OFFSETS.items():
-            if (move_x, move_y) == (dx, dy):
-                return direction_name
-
-        return "N"
-
-bot = CaveExplorationBot()
+# Main loop
+bot = None
 first_tick = True
 
 for line in sys.stdin:
-    game_state = json.loads(line)
-
-    if first_tick:
-        config = game_state["config"]
-        print(f"Cave bot started on {config['width']}x{config['height']} map", file=sys.stderr)
-        first_tick = False
-
-    bot_position = bot.remember_world(game_state)
-    visible_gems = game_state.get("visible_gems", [])
-
-    target_position = bot.choose_target_position(bot_position, visible_gems)
-    chosen_direction = bot.decide_direction(bot_position, target_position, visible_gems)
-
-    print(chosen_direction)
-    sys.stdout.flush()
+    try:
+        data = json.loads(line)
+        
+        if first_tick:
+            config = data.get("config", {})
+            bot = CaveBot(config)
+            print(f"CaveExplorer bot launching on {config.get('width')}x{config.get('height')} map", 
+                  file=sys.stderr)
+            first_tick = False
+        
+        direction = bot.tick_update(data)
+        print(direction)
+        sys.stdout.flush()
+        
+    except json.JSONDecodeError:
+        print("Error parsing JSON", file=sys.stderr)
+        print("N")  # Safe fallback
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print("N")  # Safe fallback
+        sys.stdout.flush()
