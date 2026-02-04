@@ -1,5 +1,3 @@
-# gpt v.2.1
-
 #!/usr/bin/env python3
 import sys, json, math, heapq, random
 from collections import deque
