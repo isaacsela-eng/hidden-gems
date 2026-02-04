@@ -1,167 +1,231 @@
 #!/usr/bin/env python3
-import sys, json, math, heapq, random
-from collections import deque
+import sys, json, math, random, heapq
 
-UNKNOWN_CELL = 0
-WALL_CELL = 1
-FLOOR_CELL = 2
+sys.stdout.flush()
 
-DIRECTION_OFFSETS = {
+# ------------------------------
+# Constants & Directions
+# ------------------------------
+UNKNOWN = 0
+WALL = 1
+FLOOR = 2
+
+DIRS = {
     "N": (0, -1),
     "S": (0, 1),
     "W": (-1, 0),
     "E": (1, 0),
 }
 
-def manhattan_distance(from_position, to_position):
-    return abs(from_position[0] - to_position[0]) + abs(from_position[1] - to_position[1])
-
-class CaveExplorationBot:
-    def __init__(self):
-        self.known_map = {}
-        self.recent_positions = deque(maxlen=20)
-
-    def remember_world(self, game_state):
-        bot_position = tuple(game_state["bot"])
-
-        for wall_x, wall_y in game_state.get("wall", []):
-            self.known_map[(wall_x, wall_y)] = WALL_CELL
-
-        for floor_x, floor_y in game_state.get("floor", []):
-            self.known_map.setdefault((floor_x, floor_y), FLOOR_CELL)
-
-        self.known_map[bot_position] = FLOOR_CELL
-        self.recent_positions.append(bot_position)
-
-        return bot_position
-
-    def get_walkable_positions_around(self, position):
-        for move_x, move_y in DIRECTION_OFFSETS.values():
-            next_position = (position[0] + move_x, position[1] + move_y)
-            if self.known_map.get(next_position, UNKNOWN_CELL) != WALL_CELL:
-                yield next_position
-
-    def find_path_using_a_star(self, start_position, target_position):
-        if start_position == target_position:
-            return []
-
-        priority_queue = [(0, start_position)]
-        previous_position = {start_position: None}
-        travel_cost = {start_position: 0}
-
-        while priority_queue:
-            _, current_position = heapq.heappop(priority_queue)
-
-            if current_position == target_position:
-                break
-
-            for neighbor_position in self.get_walkable_positions_around(current_position):
-                new_cost = travel_cost[current_position] + 1
-
-                if neighbor_position not in travel_cost or new_cost < travel_cost[neighbor_position]:
-                    travel_cost[neighbor_position] = new_cost
-                    estimated_total_cost = new_cost + manhattan_distance(neighbor_position, target_position)
-                    heapq.heappush(priority_queue, (estimated_total_cost, neighbor_position))
-                    previous_position[neighbor_position] = current_position
-
-        if target_position not in previous_position:
-            return None
-
-        path = []
-        current_position = target_position
-        while current_position != start_position:
-            path.append(current_position)
-            current_position = previous_position[current_position]
-        path.reverse()
-
-        return path
-
-    def find_positions_next_to_unknown_area(self):
-        frontier_positions = []
-
-        for (x, y), cell_type in self.known_map.items():
-            if cell_type == FLOOR_CELL:
-                for move_x, move_y in DIRECTION_OFFSETS.values():
-                    if self.known_map.get((x + move_x, y + move_y), UNKNOWN_CELL) == UNKNOWN_CELL:
-                        frontier_positions.append((x, y))
-                        break
-
-        return frontier_positions
-
-    def gaussian_gem_signal(self, position, visible_gems, sigma=3.0):
-        signal_strength = 0.0
-
-        for gem in visible_gems:
-            gem_x, gem_y = gem["position"]
-            distance = manhattan_distance(position, (gem_x, gem_y))
-            signal_strength += math.exp(-(distance ** 2) / (2 * sigma ** 2))
-
-        return signal_strength
-
-    def choose_random_known_floor(self, current_position):
-        possible_positions = [
-            pos for pos, cell_type in self.known_map.items()
-            if cell_type == FLOOR_CELL and pos not in self.recent_positions
-        ]
-        return random.choice(possible_positions) if possible_positions else current_position
-
-    def choose_target_position(self, bot_position, visible_gems):
-        if visible_gems:
-            best_gem = max(visible_gems, key=lambda gem: gem["ttl"])
-            return tuple(best_gem["position"])
-
-        frontier_positions = self.find_positions_next_to_unknown_area()
-        if frontier_positions:
-            return min(frontier_positions, key=lambda pos: manhattan_distance(bot_position, pos))
-
-        return self.choose_random_known_floor(bot_position)
-
-    def decide_direction(self, bot_position, target_position, visible_gems):
-        path_to_target = self.find_path_using_a_star(bot_position, target_position)
-
-        if path_to_target:
-            next_position = path_to_target[0]
-        else:
-            best_direction = None
-            strongest_signal = -1e9
-
-            for direction_name, (move_x, move_y) in DIRECTION_OFFSETS.items():
-                candidate_position = (bot_position[0] + move_x, bot_position[1] + move_y)
-
-                if self.known_map.get(candidate_position, UNKNOWN_CELL) != WALL_CELL:
-                    signal = self.gaussian_gem_signal(candidate_position, visible_gems)
-
-                    if signal > strongest_signal:
-                        strongest_signal = signal
-                        best_direction = direction_name
-
-            return best_direction or "N"
-
-        move_x = next_position[0] - bot_position[0]
-        move_y = next_position[1] - bot_position[1]
-
-        for direction_name, (dx, dy) in DIRECTION_OFFSETS.items():
-            if (move_x, move_y) == (dx, dy):
-                return direction_name
-
-        return "N"
-
-bot = CaveExplorationBot()
+# ------------------------------
+# Global Variables
+# ------------------------------
+grid = None
+signal_map = None
+visit_count = {}
+known_gems = {}  # (x,y) -> ttl
+width = height = None
 first_tick = True
+last_pos = None
+last_signal = None
 
+# ------------------------------
+# Helper Functions
+# ------------------------------
+def heuristic(a, b):
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+def astar(start, goals):
+    open_set = []
+    heapq.heappush(open_set, (0, start))
+    came_from = {start: None}
+    g_score = {start: 0}
+    goals_set = set(goals)
+    while open_set:
+        _, current = heapq.heappop(open_set)
+        if current in goals_set:
+            path = []
+            while current != start:
+                path.append(current)
+                current = came_from[current]
+            path.reverse()
+            return path
+        x, y = current
+        for dx, dy in DIRS.values():
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < width and 0 <= ny < height:
+                if grid[ny][nx] == WALL:
+                    continue
+                neighbor = (nx, ny)
+                tentative_g = g_score[current] + 1 + visit_count.get(neighbor, 0)*0.1
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + min(heuristic(neighbor, g) for g in goals)
+                    heapq.heappush(open_set,(f_score, neighbor))
+                    came_from[neighbor] = current
+    return []
+
+def neighbors(x, y):
+    for d, (dx, dy) in DIRS.items():
+        nx, ny = x+dx, y+dy
+        if 0 <= nx < width and 0 <= ny < height:
+            yield d, nx, ny
+
+def get_signal_vector(bx, by):
+    vx, vy = 0.0, 0.0
+    for d, nx, ny in neighbors(bx, by):
+        if grid[ny][nx] != WALL:
+            diff = signal_map[ny][nx] - signal_map[by][bx]
+            dx, dy = nx-bx, ny-by
+            vx += dx*diff
+            vy += dy*diff
+    if last_pos is not None and last_signal is not None:
+        lx, ly = last_pos
+        ds = last_signal
+        vx += (bx-lx)*(signal_map[by][bx]-ds)
+        vy += (by-ly)*(signal_map[by][bx]-ds)
+    length = math.hypot(vx, vy)
+    if length>0:
+        return vx/length, vy/length
+    return 0, 0
+
+# ------------------------------
+# Main Loop
+# ------------------------------
 for line in sys.stdin:
-    game_state = json.loads(line)
+    data = json.loads(line)
 
     if first_tick:
-        config = game_state["config"]
-        print(f"Cave bot started on {config['width']}x{config['height']} map", file=sys.stderr)
-        first_tick = False
+        cfg = data["config"]
+        width = cfg["width"]
+        height = cfg["height"]
+        grid = [[UNKNOWN for _ in range(width)] for _ in range(height)]
+        signal_map = [[0.0 for _ in range(width)] for _ in range(height)]
+        first_tick=False
 
-    bot_position = bot.remember_world(game_state)
-    visible_gems = game_state.get("visible_gems", [])
+    bx, by = data["bot"]
+    signal = data.get("signal",0.0)
 
-    target_position = bot.choose_target_position(bot_position, visible_gems)
-    chosen_direction = bot.decide_direction(bot_position, target_position, visible_gems)
+    # ------------------------------
+    # Update map
+    # ------------------------------
+    for x, y in data.get("wall", []):
+        grid[y][x] = WALL
+    for x, y in data.get("floor", []):
+        grid[y][x] = FLOOR
 
-    print(chosen_direction)
+    # ------------------------------
+    # Update gem memory
+    # ------------------------------
+    visible = data.get("visible_gems", [])
+    for g in visible:
+        gx, gy = g["position"]
+        ttl = g.get("ttl",100)
+        known_gems[(gx, gy)] = ttl
+
+    # Decay gem TTL
+    for pos in list(known_gems.keys()):
+        known_gems[pos] -= 1
+        if known_gems[pos] <= 0:
+            del known_gems[pos]
+
+    # ------------------------------
+    # Update signal heatmap
+    # ------------------------------
+    signal_map[by][bx] = max(signal_map[by][bx], signal)
+
+    best_move = None
+
+    # ------------------------------
+    # 1️⃣ IMMEDIATE GEM COLLECTION
+    # ------------------------------
+    if visible:
+        # prioritize closest visible gem
+        target = min([tuple(g["position"]) for g in visible], key=lambda p: heuristic(p,(bx,by)))
+        path = astar((bx,by), [target])
+        if path:
+            nx, ny = path[0]
+            for d, (dx, dy) in DIRS.items():
+                if bx+dx==nx and by+dy==ny:
+                    best_move = d
+
+    # ------------------------------
+    # 2️⃣ KNOWN GEM MEMORY
+    # ------------------------------
+    if best_move is None and known_gems:
+        target = min(known_gems.keys(), key=lambda p: heuristic(p,(bx,by)))
+        path = astar((bx,by), [target])
+        if path:
+            nx, ny = path[0]
+            for d, (dx, dy) in DIRS.items():
+                if bx+dx==nx and by+dy==ny:
+                    best_move = d
+
+    # ------------------------------
+    # 3️⃣ SIGNAL PREDICTION
+    # ------------------------------
+    if best_move is None:
+        vx, vy = get_signal_vector(bx, by)
+        best_score = -1e9
+        for d, nx, ny in neighbors(bx, by):
+            if grid[ny][nx]==WALL: continue
+            dx, dy = nx-bx, ny-by
+            align = dx*vx + dy*vy
+            score = align*2.0 + signal_map[ny][nx]*1.5
+            if grid[ny][nx]==UNKNOWN: score+=0.6
+            score -= visit_count.get((nx,ny),0)*0.15
+            score += random.random()*0.02
+            if score>best_score:
+                best_score = score
+                best_move = d
+
+    # ------------------------------
+    # 4️⃣ EXPLORATION
+    # ------------------------------
+    if best_move is None or best_score<0.05:
+        frontiers = set()
+        for y in range(height):
+            for x in range(width):
+                if grid[y][x]==FLOOR:
+                    for _, nx, ny in neighbors(x,y):
+                        if grid[ny][nx]==UNKNOWN:
+                            frontiers.add((x,y))
+        if frontiers:
+            path = astar((bx,by), frontiers)
+            if path:
+                nx, ny = path[0]
+                for d,(dx,dy) in DIRS.items():
+                    if bx+dx==nx and by+dy==ny:
+                        best_move = d
+
+    # ------------------------------
+    # 5️⃣ POST-EXPLORATION (historic signals)
+    # ------------------------------
+    if best_move is None:
+        max_signal = -1
+        best_tile = None
+        for y in range(height):
+            for x in range(width):
+                if grid[y][x]!=WALL and signal_map[y][x]>max_signal:
+                    max_signal = signal_map[y][x]
+                    best_tile = (x,y)
+        if best_tile:
+            path = astar((bx,by), [best_tile])
+            if path:
+                nx, ny = path[0]
+                for d,(dx,dy) in DIRS.items():
+                    if bx+dx==nx and by+dy==ny:
+                        best_move = d
+
+    # ------------------------------
+    # fallback random move
+    # ------------------------------
+    if best_move is None:
+        best_move = random.choice(list(DIRS.keys()))
+
+    visit_count[(bx,by)] = visit_count.get((bx,by),0)+1
+    last_pos = (bx,by)
+    last_signal = signal
+
+    print(best_move)
     sys.stdout.flush()
