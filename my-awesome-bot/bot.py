@@ -198,3 +198,4 @@ for line in sys.stdin:
 
     move = move_from_to(bot, nxt)
     print(move, flush=True)
+#das funktioniert nicht
